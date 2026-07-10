@@ -2,6 +2,7 @@
 
 import logging
 import time
+from decimal import Decimal
 from typing import TYPE_CHECKING
 from typing import Any
 from typing import ClassVar
@@ -10,11 +11,16 @@ from typing import cast
 import stripe
 from getpaid_core.enums import FraudEvent
 from getpaid_core.enums import PaymentEvent
+from getpaid_core.exceptions import ChargeFailure
 from getpaid_core.exceptions import CredentialsError
 from getpaid_core.exceptions import InvalidCallbackError
+from getpaid_core.exceptions import LockFailure
+from getpaid_core.exceptions import RefundFailure
 from getpaid_core.processor import BaseProcessor
 from getpaid_core.protocols import Payment
+from getpaid_core.types import ChargeResult
 from getpaid_core.types import PaymentUpdate
+from getpaid_core.types import RefundResult
 from getpaid_core.types import TransactionResult
 from stripe import StripeClient
 
@@ -24,6 +30,8 @@ from .currencies import to_minor
 
 
 if TYPE_CHECKING:
+    from stripe import PaymentIntentService
+    from stripe import RefundService
     from stripe.checkout import SessionService
 
 
@@ -496,6 +504,150 @@ class StripeProcessor(BaseProcessor):
                 },
             )
         return None
+
+    def _require_payment_intent_id(
+        self, exc_class: type[Exception]
+    ) -> str:
+        """The invariant of SPEC §6: external_id is the id money
+        operations act on. Before the promoting webhook it is still
+        cs_… and no money operation is possible."""
+        external_id = self.payment.external_id
+        if not external_id or not external_id.startswith("pi_"):
+            raise exc_class(
+                "No PaymentIntent is bound to this payment yet "
+                f"(external_id={external_id!r}). Money operations "
+                "require the pi_… id delivered by the first webhook."
+            )
+        return external_id
+
+    async def charge(
+        self, amount: Decimal | None = None, **kwargs
+    ) -> ChargeResult:
+        """Capture a manually-authorized PaymentIntent (SPEC §8).
+
+        Partial capture: Stripe auto-releases the remainder. Always
+        returns ``async_call=True`` — core applies CHARGE_REQUESTED and
+        the authoritative PAYMENT_CAPTURED arrives exactly once, via
+        ``payment_intent.succeeded``.
+        """
+        intent_id = self._require_payment_intent_id(ChargeFailure)
+        client = self._get_client()
+        intent = await client.payment_intents.retrieve_async(intent_id)
+        if intent.status != "requires_capture":
+            raise ChargeFailure(
+                f"PaymentIntent {intent_id} is not capturable: status is "
+                f"{intent.status!r}, expected 'requires_capture'."
+            )
+
+        currency = str(intent.currency)
+        params: dict[str, Any] = {}
+        if amount is not None:
+            params["amount_to_capture"] = to_minor(amount, currency)
+        try:
+            captured = await client.payment_intents.capture_async(
+                intent_id,
+                cast("PaymentIntentService.CaptureParams", params),
+            )
+        except stripe.StripeError as exc:
+            raise ChargeFailure(
+                f"Stripe capture failed for {intent_id}: {exc}"
+            ) from exc
+
+        return ChargeResult(
+            amount_charged=from_minor(captured.amount_received, currency),
+            success=captured.status in ("succeeded", "processing"),
+            async_call=True,
+            provider_data={
+                "payment_intent_id": captured.id,
+                "status": captured.status,
+            },
+        )
+
+    async def release_lock(self, **kwargs) -> Decimal:
+        """Cancel a manually-authorized PaymentIntent (SPEC §8).
+
+        Legal only at ``requires_capture`` — that *is* the lock state;
+        no partial release exists (use a partial ``charge()``). Returns
+        the full released amount; ``payment_intent.canceled`` confirms
+        LOCK_RELEASED in the FSM.
+        """
+        intent_id = self._require_payment_intent_id(LockFailure)
+        client = self._get_client()
+        intent = await client.payment_intents.retrieve_async(intent_id)
+        if intent.status != "requires_capture":
+            raise LockFailure(
+                f"PaymentIntent {intent_id} holds no releasable lock: "
+                f"status is {intent.status!r}, expected "
+                "'requires_capture'."
+            )
+
+        locked = from_minor(intent.amount_capturable, str(intent.currency))
+        try:
+            await client.payment_intents.cancel_async(intent_id)
+        except stripe.StripeError as exc:
+            raise LockFailure(
+                f"Stripe cancel failed for {intent_id}: {exc}"
+            ) from exc
+        return locked
+
+    async def start_refund(
+        self, amount: Decimal | None = None, **kwargs
+    ) -> RefundResult:
+        """Create a refund against the PaymentIntent (SPEC §9).
+
+        Omitted amount = full refund. ``reason`` is deliberately not
+        exposed ('fraudulent' has block-list side effects).
+        """
+        intent_id = self._require_payment_intent_id(RefundFailure)
+        params: dict[str, Any] = {
+            "payment_intent": intent_id,
+            # refund metadata does not inherit — set at creation
+            "metadata": {"payment_id": str(self.payment.id)},
+        }
+        if amount is not None:
+            params["amount"] = to_minor(amount, self.payment.currency)
+
+        client = self._get_client()
+        try:
+            refund = await client.refunds.create_async(
+                cast("RefundService.CreateParams", params)
+            )
+        except stripe.StripeError as exc:
+            raise RefundFailure(
+                f"Stripe refund failed for {intent_id}: {exc}"
+            ) from exc
+
+        return RefundResult(
+            amount=from_minor(refund.amount, str(refund.currency)),
+            provider_data={
+                # paynow convention; the slot holds the latest refund
+                "refund_id": refund.id,
+                "status": refund.status,
+            },
+        )
+
+    async def cancel_refund(self, **kwargs) -> bool:
+        """Cancel a refund awaiting customer action (SPEC §9).
+
+        Only refunds in ``requires_action`` (bank-transfer-style
+        methods) are API-cancelable; **card refunds are Dashboard-only
+        and this effectively always returns False for card payments.**
+        """
+        refund_id = self.payment.provider_data.get("refund_id")
+        if not refund_id:
+            raise RefundFailure(
+                "Missing refund identifier. Expected "
+                'provider_data["refund_id"] set by start_refund().'
+            )
+        client = self._get_client()
+        try:
+            await client.refunds.cancel_async(str(refund_id))
+        except stripe.StripeError as exc:
+            logger.info(
+                "Stripe refused to cancel refund %s: %s", refund_id, exc
+            )
+            return False
+        return True
 
     def _map_review_event(
         self, event_type: str, obj: dict, event_id: str | None

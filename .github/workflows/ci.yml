@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        run: pip install uv
+
+      - name: Install dependencies
+        # --all-extras: tests/test_simulator_plugin.py imports getpaid_simulator
+        run: uv sync --all-extras
+
+      - name: Lint with ruff
+        run: uv run ruff check .
+
+      - name: Type check with ty
+        run: uv run ty check
+
+      - name: Audit dependencies
+        # --skip-editable: the project itself is installed editable at a
+        # not-yet-released version, so it cannot be audited against PyPI.
+        # Known vulnerabilities in dependencies still fail the build.
+        run: uv run pip-audit --skip-editable
+
+      - name: Run tests
+        run: uv run pytest --tb=short

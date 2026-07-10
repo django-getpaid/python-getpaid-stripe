@@ -1,0 +1,136 @@
+[project]
+name = 'python-getpaid-stripe'
+dynamic = ["version"]
+description = 'Stripe payment gateway integration for python-getpaid ecosystem.'
+readme = 'README.md'
+license = {text = 'MIT'}
+authors = [
+    {name = 'Dominik Kozaczko', email = 'dominik@kozaczko.info'},
+]
+requires-python = '>=3.12'
+classifiers = [
+    'Development Status :: 4 - Beta',
+    'Intended Audience :: Developers',
+    'License :: OSI Approved :: MIT License',
+    'Programming Language :: Python :: 3.12',
+    'Programming Language :: Python :: 3.13',
+    'Topic :: Office/Business :: Financial',
+    'Topic :: Office/Business :: Financial :: Point-Of-Sale',
+    'Typing :: Typed',
+]
+dependencies = [
+    'python-getpaid-core>=3.2.0',
+    'stripe[async]>=12.0,<13',
+    "anyio>=4.0",
+]
+
+[project.optional-dependencies]
+simulator = [
+    'python-getpaid-simulator>=3.0.0',
+    'litestar>=2.0',
+]
+
+[dependency-groups]
+dev = [
+    'pytest>=8.0',
+    'pytest-asyncio>=0.24.0',
+    'pytest-cov>=5.0',
+    'respx>=0.22.0',
+    'ruff>=0.9.0',
+    'pre-commit>=4.0',
+    'ty>=0.0.16',
+    'pip-audit>=2.7.0',
+    "python-getpaid-simulator>=3.1.0",
+    "litestar>=2.0",
+    "packaging>=24.0",
+]
+
+[project.urls]
+Homepage = 'https://github.com/django-getpaid/python-getpaid-stripe'
+Repository = 'https://github.com/django-getpaid/python-getpaid-stripe'
+Changelog = 'https://github.com/django-getpaid/python-getpaid-stripe/releases'
+
+[project.entry-points."getpaid.backends"]
+stripe = 'getpaid_stripe.processor:StripeProcessor'
+
+[project.entry-points."getpaid.simulator.providers"]
+stripe = 'getpaid_stripe.simulator:get_plugin'
+
+[build-system]
+requires = ['hatchling']
+build-backend = 'hatchling.build'
+
+[tool.hatch.build.targets.wheel]
+packages = ['src/getpaid_stripe']
+
+[tool.hatch.version]
+path = "src/getpaid_stripe/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ['tests']
+asyncio_mode = 'auto'
+
+[tool.coverage.run]
+branch = true
+source = ['getpaid_stripe']
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+target-version = 'py312'
+line-length = 80
+src = ['src', 'tests']
+
+[tool.ruff.lint]
+select = [
+    'E',    # pycodestyle errors
+    'W',    # pycodestyle warnings
+    'F',    # pyflakes
+    'I',    # isort
+    'N',    # pep8-naming
+    'UP',   # pyupgrade
+    'B',    # flake8-bugbear
+    'A',    # flake8-builtins
+    'SIM',  # flake8-simplify
+    'TC',   # type-checking imports
+    'RUF',  # ruff-specific
+]
+ignore = [
+    'N818',  # Exception names match getpaid-core convention
+    'B027',  # Empty methods in ABC are intentional default no-ops
+]
+
+[tool.ruff.lint.per-file-ignores]
+'tests/**' = ['TC001', 'RUF012']
+
+[tool.ruff.lint.isort]
+force-single-line = true
+lines-after-imports = 2
+known-first-party = ['getpaid_stripe']
+
+# --- ty type checker ---
+[tool.ty.environment]
+python-version = '3.12'
+
+[tool.ty.terminal]
+error-on-warning = true
+
+[[tool.ty.overrides]]
+include = ['tests/**']
+[tool.ty.overrides.rules]
+unresolved-attribute = 'ignore'
+invalid-argument-type = 'ignore'
+
+# Simulator files depend on optional extras (litestar, getpaid_simulator)
+[[tool.ty.overrides]]
+include = ['src/getpaid_stripe/simulator/**']
+[tool.ty.overrides.rules]
+unresolved-attribute = 'ignore'
+unresolved-import = 'ignore'
+
+[[tool.ty.overrides]]
+include = ['tests/test_simulator_plugin.py']
+[tool.ty.overrides.rules]
+unresolved-attribute = 'ignore'
+unresolved-import = 'ignore'

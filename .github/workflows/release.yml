@@ -1,0 +1,80 @@
+name: Release
+
+# Gate releases on CI: this workflow runs only after the "CI" workflow
+# (see ci.yml) has completed successfully on the main branch.
+on:
+  workflow_run:
+    workflows: ["CI"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    # Only release when the triggering CI run actually succeeded.
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0  # Full history needed for version detection
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        run: pip install uv
+
+      # Version is read from __init__.py (dynamic via hatch)
+      - name: Detect version from __init__.py
+        id: get-version
+        run: |
+          init_py=$(grep -A2 '\[tool\.hatch\.version\]' pyproject.toml | grep '^path\s*=' | head -1 | sed -E "s/path\s*=\s*['\"]([^'\"]+)['\"].*/\1/")
+          version=$(grep '__version__' "$init_py" | head -1 | sed -E "s/.*= ['\"]([^'\"]+)['\"].*/\1/")
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check if tag already exists
+        id: check-tag
+        run: |
+          tag="v${{ steps.get-version.outputs.version }}"
+          if git rev-parse "$tag" >/dev/null 2>&1; then
+            echo "already_tagged=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already_tagged=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Tag new version
+        if: steps.check-tag.outputs.already_tagged == 'false'
+        run: |
+          tag="v${{ steps.get-version.outputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$tag" -m "Release $tag"
+          git push origin "$tag"
+
+      - name: Build package
+        run: uv build
+
+      # NOTE: consider switching to PyPI trusted publishing (OIDC) —
+      # https://docs.pypi.org/trusted-publishers/ — instead of a
+      # long-lived PYPI_TOKEN secret. With trusted publishing you drop
+      # the `password:` input, add `permissions: id-token: write` to
+      # this job, and register the workflow on PyPI.
+      - name: Publish package on PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          password: ${{ secrets.PYPI_TOKEN }}
+
+      - name: Publish the release notes
+        if: steps.check-tag.outputs.already_tagged == 'false'
+        uses: release-drafter/release-drafter@v5.20.0
+        with:
+          publish: true
+          name: v${{ steps.get-version.outputs.version }}
+          tag: v${{ steps.get-version.outputs.version }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

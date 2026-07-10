@@ -27,6 +27,8 @@ from stripe import StripeClient
 from .currencies import STRIPE_PRESENTMENT_CURRENCIES
 from .currencies import from_minor
 from .currencies import to_minor
+from .types import API_KEY_PREFIXES
+from .types import SANDBOX_KEY_PREFIXES
 
 
 if TYPE_CHECKING:
@@ -36,9 +38,6 @@ if TYPE_CHECKING:
 
 
 logger = logging.getLogger(__name__)
-
-API_KEY_PREFIXES = ("sk_test_", "sk_live_", "rk_")
-SANDBOX_KEY_PREFIXES = ("sk_test_", "rk_test_")
 
 
 class StripeProcessor(BaseProcessor):
@@ -193,7 +192,7 @@ class StripeProcessor(BaseProcessor):
             external_id=session.id,
             provider_data={
                 "session_id": session.id,
-                "expires_at": session.expires_at,
+                "expires_at": getattr(session, "expires_at", None),
             },
         )
 

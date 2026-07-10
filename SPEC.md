@@ -163,8 +163,11 @@ at the [event-mapping ticket](http://192.168.129.37:30008/minder/python-getpaid-
 (default 300 s tolerance). **Requires the raw request body** — framework
 adapters must pass `raw_body` (paynow convention). Pure computation, no async
 variant needed. `SignatureVerificationError` / missing raw_body →
-`InvalidCallbackError`. v2 "thin" payloads are rejected by `construct_event`
-(ValueError) → `InvalidCallbackError`; this plugin is v1-events-only.
+`InvalidCallbackError`. v2 "thin" payloads → `InvalidCallbackError`; this
+plugin is v1-events-only. *(Amended during implementation: stripe-python
+12.x's `construct_event` does not yet raise ValueError on thin payloads —
+that guard exists only on master — so the processor checks the v1 event
+envelope, `event.object == "event"`, explicitly.)*
 
 ### `handle_callback(data, headers, **kwargs) -> PaymentUpdate | None`
 

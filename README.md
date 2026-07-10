@@ -141,8 +141,8 @@ Point the processor at the simulator with the internal `api_base`
 config key. The fake hosted checkout offers pay / pay-delayed /
 decline / abandon; `POST /sim/stripe/ops/{order_id}` forces
 transitions with no natural actor (`expire_session`, `expire_auth`
-time-travel, `settle_delayed`, `fail_refund`, `set_refund_mode`,
-`open_review` / `close_review`). Webhooks carry genuine HMAC
+time-travel, `settle_delayed` / `fail_delayed`, `fail_refund`,
+`set_refund_mode`, `open_review` / `close_review`). Webhooks carry genuine HMAC
 `Stripe-Signature` headers plus deliberate ignore-list traffic
 (`charge.*`, `checkout.session.async_payment_*`) so the processor's
 ignore behavior is exercised under realistic fire.

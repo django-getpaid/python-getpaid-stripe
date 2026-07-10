@@ -203,6 +203,18 @@ async def test_delayed_payment_settles_via_ops(harness):
     assert events_of(updates) == [PaymentEvent.PAYMENT_CAPTURED]
 
 
+async def test_delayed_payment_fails_via_ops(harness):
+    order_id = await harness.prepare()
+    await harness.buyer("pay_delayed")
+    await harness.drain_updates()
+
+    await harness.ops(order_id, "fail_delayed")
+    updates = await harness.drain_updates()
+    # async_payment_failed is ignored; payment_intent.payment_failed
+    # is the truth
+    assert events_of(updates) == [PaymentEvent.FAILED]
+
+
 # --- pre-auth walks ------------------------------------------------------
 
 

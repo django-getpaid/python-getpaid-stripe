@@ -95,8 +95,14 @@ Decided at the [configuration ticket](http://192.168.129.37:30008/minder/python-
 
 Deliberate omissions: **no publishable key** (nothing in a hosted-Checkout
 flow consumes it), **no `sandbox` flag** (derive: property
-`is_sandbox = api_key.startswith("sk_test_")` — a flag that can contradict
-the key is a lie waiting to happen), no HTTP-timeout knob in v1.
+`is_sandbox = api_key.startswith(("sk_test_", "rk_test_"))` — restricted
+keys analogous per the deciding ticket; a flag that can contradict the key
+is a lie waiting to happen), no HTTP-timeout knob in v1.
+
+*(Amended during implementation: two **internal, undocumented** config
+keys exist for tests and the simulator wiring only — `api_base`
+(overrides the SDK base address) and `http_client` (injects a stripe
+HTTP client). They are not part of the public schema.)*
 
 Webhook-endpoint `enabled_events` is **Stripe Dashboard configuration**, not a
 setting; the exact list is in §7.
@@ -126,7 +132,8 @@ Stripe amounts are `int` minor units; currency codes lowercase ISO 4217.
 ## 6. `prepare_transaction()` — Checkout Session creation
 
 Decided at the [surface ticket](http://192.168.129.37:30008/minder/python-getpaid-stripe/issues/6).
-Create a **payment-mode** Checkout Session (`ui_mode: hosted_page`) with:
+Create a **payment-mode** Checkout Session (`ui_mode: hosted` — the API
+literal; "hosted_page" was descriptive) with:
 
 - `line_items`: single item from the payment (name/description per adapter
   kwargs), `amount = to_minor(payment.amount, currency)`, lowercase currency;
@@ -144,7 +151,9 @@ Create a **payment-mode** Checkout Session (`ui_mode: hosted_page`) with:
   configuration decides).
 
 Return
-`TransactionResult(method=REDIRECT, redirect_url=session.url, external_id=session.id, provider_data={"session_id": cs_…, "expires_at": …})`.
+`TransactionResult(method="GET", redirect_url=session.url, external_id=session.id, provider_data={"session_id": cs_…, "expires_at": …})`.
+*(Amended during implementation: core's `BackendMethod` enum has no
+REDIRECT — the redirect flow uses `GET`, the paynow precedent.)*
 
 **Id lifecycle**: under deferred PI creation only `cs_…` exists at prepare
 time. The first webhook carrying the PaymentIntent id re-points the payment:
@@ -335,19 +344,36 @@ Coverage/CI mirrors paynow (ruff, mypy/pyright as configured there,
 ## 12. Flagged for verification during implementation
 
 Collected from the research assets' "unverified" sections — check these
-against live test mode before relying on them:
+against live test mode before relying on them. *Implementation status
+(2026-07-10): none could be verified against live test mode (no
+credentials in the build environment); each is either defensively
+implemented or TODO-tagged as noted. The live-mode check belongs to the
+§13.3 manual smoke.*
 
 - `review.closed.closed_reason` value semantics (§7 fraud rows).
+  *Status: TODO tag at the mapping site; only `approved` → ACCEPT, all
+  else → REJECT with the reason preserved in `fraud_message`.*
 - Manual capture × automatic payment methods: does Checkout silently filter
   incompatible methods or error?
+  *Status: documented as an operator caveat in the README; not
+  code-relevant (the plugin never sends `payment_method_types`).*
 - Whether `payment_intent.canceled` actually fires on automatic auth expiry.
+  *Status: defensively implemented — if it fires, §7's mapping yields
+  LOCK_RELEASED; if not, `fetch_payment_status()` is the deterministic
+  backstop. The simulator emits it on `expire_auth` time-travel.*
 - Three-decimal nearest-ten rule enforcement (rule text survives only in an
   archived docs page).
+  *Status: implemented as specified (round-to-nearest-ten); harmless if
+  Stripe stopped enforcing it.*
 - Error type raised when canceling a non-`requires_action` refund (drives the
   `cancel_refund` False path).
+  *Status: implementation catches all `stripe.StripeError` → False, so
+  the exact type is irrelevant to correctness.*
 - `charge.succeeded` timing at authorization in manual-capture flows
   (irrelevant to the FSM — charge events ignored — but affects simulator
   ignore-traffic realism).
+  *Status: TODO tag in the simulator; it emits no charge event at
+  authorization time.*
 
 ## 13. Acceptance criteria
 

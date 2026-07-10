@@ -18,6 +18,17 @@ def processor(stripe_config, mock_payment) -> StripeProcessor:
     return StripeProcessor(mock_payment, stripe_config)
 
 
+@pytest.fixture
+def bound_processor(stripe_config) -> StripeProcessor:
+    """Processor whose payment is already bound to the PaymentIntent.
+
+    Review payloads carry no metadata; they correlate through the
+    ``payment_intent`` back-reference against ``external_id``.
+    """
+    payment = make_mock_payment(external_id="pi_test_0001")
+    return StripeProcessor(payment, stripe_config)
+
+
 async def handle(processor, evt):
     return await processor.handle_callback(evt, {})
 
@@ -272,7 +283,8 @@ async def test_charge_events_ignored(processor, event_type):
 # --- review.* → fraud events ------------------------------------------
 
 
-async def test_review_opened_maps_to_fraud_review(processor):
+async def test_review_opened_maps_to_fraud_review(bound_processor):
+    processor = bound_processor
     evt = payloads.event("review.opened", payloads.review(is_open=True))
     update = await handle(processor, evt)
 
@@ -281,7 +293,10 @@ async def test_review_opened_maps_to_fraud_review(processor):
     assert update.external_id == "pi_test_0001"
 
 
-async def test_review_closed_approved_maps_to_fraud_accept(processor):
+async def test_review_closed_approved_maps_to_fraud_accept(
+    bound_processor,
+):
+    processor = bound_processor
     evt = payloads.event(
         "review.closed",
         payloads.review(is_open=False, closed_reason="approved"),
@@ -296,8 +311,9 @@ async def test_review_closed_approved_maps_to_fraud_accept(processor):
     "closed_reason", ["refunded", "refunded_as_fraud", "disputed"]
 )
 async def test_review_closed_otherwise_maps_to_fraud_reject(
-    processor, closed_reason
+    bound_processor, closed_reason
 ):
+    processor = bound_processor
     evt = payloads.event(
         "review.closed",
         payloads.review(is_open=False, closed_reason=closed_reason),
@@ -350,6 +366,50 @@ async def test_foreign_payment_metadata_rejected(stripe_config):
     )
     with pytest.raises(InvalidCallbackError):
         await handle(processor, evt)
+
+
+async def test_uncorrelatable_payment_intent_ignored(stripe_config):
+    # Subscription-born traffic on a shared account: no metadata, no
+    # matching id — must never move money-state (SPEC §7).
+    processor = StripeProcessor(
+        make_mock_payment(external_id="pi_test_0001"), stripe_config
+    )
+    evt = payloads.event(
+        "payment_intent.succeeded",
+        payloads.payment_intent(
+            intent_id="pi_foreign_sub",
+            amount_received=9999,
+            metadata={},
+        ),
+    )
+    assert await handle(processor, evt) is None
+
+
+async def test_expiry_refund_without_metadata_correlates_by_intent(
+    bound_processor,
+):
+    # Stripe-generated expiry refunds carry none of our metadata;
+    # they correlate via the payment_intent back-reference.
+    evt = payloads.event(
+        "refund.created",
+        payloads.refund(
+            status="succeeded",
+            reason="expired_uncaptured_charge",
+            metadata={},
+        ),
+    )
+    update = await handle(bound_processor, evt)
+
+    assert update is not None
+    assert update.payment_event == PaymentEvent.REFUND_CONFIRMED
+
+
+async def test_review_for_other_intent_ignored(stripe_config):
+    processor = StripeProcessor(
+        make_mock_payment(external_id="pi_other_042"), stripe_config
+    )
+    evt = payloads.event("review.opened", payloads.review(is_open=True))
+    assert await handle(processor, evt) is None
 
 
 async def test_both_events_fire_dedup_story(processor):

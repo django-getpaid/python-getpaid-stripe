@@ -58,6 +58,7 @@ async def test_session_params_payment_mode_and_amount(
 
     form = sent_form(sessions_route)
     assert form["mode"] == "payment"
+    assert form["ui_mode"] == "hosted"
     assert form["line_items[0][price_data][currency]"] == "pln"
     assert form["line_items[0][price_data][unit_amount]"] == "12345"
     assert form["line_items[0][quantity]"] == "1"
@@ -175,6 +176,16 @@ async def test_session_expires_in_maps_to_expires_at(
     form = sent_form(sessions_route)
     expires_at = int(form["expires_at"])
     assert before + 45 * 60 <= expires_at <= after + 45 * 60
+
+
+@pytest.mark.parametrize("minutes", [29, 1441, 0])
+async def test_session_expires_in_out_of_range_raises(
+    stripe_config, mock_payment, minutes
+):
+    stripe_config["session_expires_in"] = minutes
+    processor = StripeProcessor(mock_payment, stripe_config)
+    with pytest.raises(ValueError):
+        await processor.prepare_transaction()
 
 
 async def test_no_expires_at_by_default(

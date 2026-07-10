@@ -19,6 +19,10 @@ from litestar.response import Redirect
 from litestar.response import Response
 
 from getpaid_stripe.simulator.transitions import REFUND_TRANSITIONS
+from getpaid_stripe.simulator.webhooks import CHARGE_PREFIX
+from getpaid_stripe.simulator.webhooks import INTENT_PREFIX
+from getpaid_stripe.simulator.webhooks import REFUND_PREFIX
+from getpaid_stripe.simulator.webhooks import SESSION_PREFIX
 from getpaid_stripe.simulator.webhooks import charge_object
 from getpaid_stripe.simulator.webhooks import deliver_events
 from getpaid_stripe.simulator.webhooks import payment_intent_object
@@ -29,10 +33,6 @@ from getpaid_stripe.simulator.webhooks import session_object
 
 logger = logging.getLogger(__name__)
 URL_ENCODED_BODY = Body(media_type=RequestEncodingType.URL_ENCODED)
-
-SESSION_PREFIX = "cs_sim_"
-INTENT_PREFIX = "pi_sim_"
-REFUND_PREFIX = "re_sim_"
 
 
 def _provider_config(request: Request[Any, Any, Any]) -> dict[str, Any]:
@@ -160,7 +160,7 @@ async def create_checkout_session(
         order_id,
         session_id=f"{SESSION_PREFIX}{order_id}",
         pi_id=f"{INTENT_PREFIX}{order_id}",
-        charge_id=f"ch_sim_{order_id}",
+        charge_id=f"{CHARGE_PREFIX}{order_id}",
     )
     order = _get_order(request, order_id)
     assert order is not None
@@ -392,9 +392,7 @@ async def cancel_refund(
         return _stripe_error(
             404, f"No such refund: '{refund_id}'", code="resource_missing"
         )
-    if "canceled" not in REFUND_TRANSITIONS.get(
-        str(refund.get("status")), set()
-    ) or refund.get("status") != "requires_action":
+    if refund.get("status") != "requires_action":
         # Card refunds are never requires_action: API cancel always
         # fails for them (Dashboard-only), SPEC §9.
         return _stripe_error(
@@ -595,6 +593,22 @@ async def stripe_ops(
         await _emit(
             request,
             [("payment_intent.canceled", payment_intent_object(order))],
+        )
+    elif action == "fail_delayed":
+        order = _transition(request, order_id, "declined")
+        await _emit(
+            request,
+            [
+                # ignore-list traffic (SPEC §7)
+                (
+                    "checkout.session.async_payment_failed",
+                    session_object(order),
+                ),
+                (
+                    "payment_intent.payment_failed",
+                    payment_intent_object(order),
+                ),
+            ],
         )
     elif action == "settle_delayed":
         storage.update_order(

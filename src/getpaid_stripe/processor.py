@@ -29,6 +29,8 @@ from .currencies import from_minor
 from .currencies import to_minor
 from .types import API_KEY_PREFIXES
 from .types import SANDBOX_KEY_PREFIXES
+from .types import CaptureMethod
+from .types import StripeProviderData
 
 
 if TYPE_CHECKING:
@@ -111,7 +113,7 @@ class StripeProcessor(BaseProcessor):
         ``{CHECKOUT_SESSION_ID}`` placeholder untouched."""
         return template.replace("{payment_id}", str(self.payment.id))
 
-    def _capture_method(self, **kwargs) -> str:
+    def _capture_method(self, **kwargs) -> CaptureMethod:
         method = str(
             kwargs.get("capture_method")
             or self.get_setting("capture_method", "automatic")
@@ -121,7 +123,7 @@ class StripeProcessor(BaseProcessor):
                 f"capture_method must be 'automatic' or 'manual', "
                 f"got {method!r}"
             )
-        return method
+        return cast("CaptureMethod", method)
 
     async def prepare_transaction(self, **kwargs) -> TransactionResult:
         """Create a payment-mode Checkout Session and return the
@@ -158,6 +160,7 @@ class StripeProcessor(BaseProcessor):
 
         params: dict[str, Any] = {
             "mode": "payment",
+            "ui_mode": "hosted",
             "line_items": [
                 {
                     "quantity": 1,
@@ -179,21 +182,29 @@ class StripeProcessor(BaseProcessor):
 
         expires_in = self.get_setting("session_expires_in")
         if expires_in is not None:
-            params["expires_at"] = int(time.time()) + int(expires_in) * 60
+            expires_in = int(expires_in)
+            if not 30 <= expires_in <= 1440:
+                raise ValueError(
+                    "session_expires_in must be between 30 and 1440 "
+                    f"minutes (Stripe's expires_at bounds); got "
+                    f"{expires_in}."
+                )
+            params["expires_at"] = int(time.time()) + expires_in * 60
 
         client = self._get_client()
         session = await client.checkout.sessions.create_async(
             cast("SessionService.CreateParams", params)
         )
 
+        provider_data: StripeProviderData = {
+            "session_id": session.id,
+            "expires_at": getattr(session, "expires_at", None),
+        }
         return TransactionResult(
             method="GET",
             redirect_url=session.url,
             external_id=session.id,
-            provider_data={
-                "session_id": session.id,
-                "expires_at": getattr(session, "expires_at", None),
-            },
+            provider_data=dict(provider_data),
         )
 
     async def verify_callback(
@@ -252,24 +263,45 @@ class StripeProcessor(BaseProcessor):
                 f"Invalid webhook payload: {exc}"
             ) from exc
 
-    def _reject_foreign_payment(self, obj: dict) -> None:
-        """Raise when a payload is correlated to a different payment.
+    def _is_correlated(self, obj: dict) -> bool:
+        """Positive correlation of a payload to this payment (SPEC §7).
 
-        Uses the belt-and-braces correlation written at session
-        creation: object metadata and (sessions) client_reference_id.
+        Explicit evidence for a *different* payment raises (a routing
+        or tampering signal). No evidence at all returns False so the
+        caller log-and-ignores — uncorrelatable ``payment_intent.*``
+        from subscription-born traffic on a shared account must never
+        move money-state on this payment.
+
+        Evidence, belt and braces (SPEC §6): metadata ``payment_id``,
+        session ``client_reference_id``, or an id back-reference
+        (object ``id`` / ``payment_intent``) matching the bound
+        ``external_id``.
         """
         my_id = str(self.payment.id)
         metadata = obj.get("metadata") or {}
-        candidates = [
+        matched = False
+        for candidate in (
             metadata.get("payment_id"),
             obj.get("client_reference_id"),
-        ]
-        for candidate in candidates:
-            if candidate and str(candidate) != my_id:
+        ):
+            if not candidate:
+                continue
+            if str(candidate) != my_id:
                 raise InvalidCallbackError(
                     "Webhook payload is correlated to a different "
                     f"payment: got {candidate!r}, expected {my_id!r}."
                 )
+            matched = True
+        if matched:
+            return True
+
+        external_id = self.payment.external_id
+        if external_id:
+            for key in ("id", "payment_intent"):
+                value = obj.get(key)
+                if value and str(value) == external_id:
+                    return True
+        return False
 
     async def handle_callback(
         self, data: dict, headers: dict, **kwargs
@@ -300,16 +332,25 @@ class StripeProcessor(BaseProcessor):
             )
             return None
 
+        if event_type.startswith(
+            ("checkout.session.", "payment_intent.", "refund.", "review.")
+        ) and not self._is_correlated(obj):
+            logger.warning(
+                "Ignoring uncorrelatable stripe event %s (%s) for "
+                "payment %s",
+                event_type,
+                event_id,
+                self.payment.id,
+            )
+            return None
+
         if event_type.startswith("checkout.session."):
-            self._reject_foreign_payment(obj)
             return self._map_session_event(event_type, obj, event_id)
         if event_type.startswith("payment_intent."):
-            self._reject_foreign_payment(obj)
             return self._map_payment_intent_event(
                 event_type, obj, event_id, created
             )
         if event_type.startswith("refund."):
-            self._reject_foreign_payment(obj)
             return self._map_refund_event(obj, event_id)
         if event_type.startswith("review."):
             return self._map_review_event(event_type, obj, event_id)
@@ -345,6 +386,55 @@ class StripeProcessor(BaseProcessor):
         logger.info("Ignoring stripe event %s (%s)", event_type, event_id)
         return None
 
+    def _locked_update(
+        self,
+        obj: dict,
+        event_id: str | None = None,
+        locked_at: int | None = None,
+    ) -> PaymentUpdate:
+        return PaymentUpdate(
+            payment_event=PaymentEvent.LOCKED,
+            locked_amount=from_minor(
+                int(obj.get("amount_capturable", 0)),
+                str(obj.get("currency", "")),
+            ),
+            external_id=obj.get("id"),
+            provider_event_id=event_id,
+            provider_data=(
+                {"locked_at": locked_at} if locked_at is not None else {}
+            ),
+        )
+
+    def _captured_update(
+        self, obj: dict, event_id: str | None = None
+    ) -> PaymentUpdate:
+        return PaymentUpdate(
+            payment_event=PaymentEvent.PAYMENT_CAPTURED,
+            paid_amount=from_minor(
+                int(obj.get("amount_received", 0)),
+                str(obj.get("currency", "")),
+            ),
+            external_id=obj.get("id"),
+            provider_event_id=event_id,
+        )
+
+    def _canceled_update(
+        self, obj: dict, event_id: str | None = None
+    ) -> PaymentUpdate:
+        # Manual capture: cancel *is* releasing the lock.
+        # Automatic: a canceled intent is a failed payment.
+        manual = obj.get("capture_method") == "manual"
+        return PaymentUpdate(
+            payment_event=(
+                PaymentEvent.LOCK_RELEASED if manual else PaymentEvent.FAILED
+            ),
+            external_id=obj.get("id"),
+            provider_event_id=event_id,
+            provider_data={
+                "cancellation_reason": obj.get("cancellation_reason"),
+            },
+        )
+
     def _map_payment_intent_event(
         self,
         event_type: str,
@@ -352,50 +442,18 @@ class StripeProcessor(BaseProcessor):
         event_id: str | None,
         created: int | None,
     ) -> PaymentUpdate | None:
-        currency = str(obj.get("currency", ""))
-        external_id = obj.get("id")
-
         if event_type == "payment_intent.amount_capturable_updated":
-            return PaymentUpdate(
-                payment_event=PaymentEvent.LOCKED,
-                locked_amount=from_minor(
-                    int(obj.get("amount_capturable", 0)), currency
-                ),
-                external_id=external_id,
-                provider_event_id=event_id,
-                provider_data={"locked_at": created},
-            )
+            return self._locked_update(obj, event_id, locked_at=created)
         if event_type == "payment_intent.succeeded":
-            return PaymentUpdate(
-                payment_event=PaymentEvent.PAYMENT_CAPTURED,
-                paid_amount=from_minor(
-                    int(obj.get("amount_received", 0)), currency
-                ),
-                external_id=external_id,
-                provider_event_id=event_id,
-            )
+            return self._captured_update(obj, event_id)
         if event_type == "payment_intent.payment_failed":
             return PaymentUpdate(
                 payment_event=PaymentEvent.FAILED,
-                external_id=external_id,
+                external_id=obj.get("id"),
                 provider_event_id=event_id,
             )
         if event_type == "payment_intent.canceled":
-            # Manual capture: cancel *is* releasing the lock.
-            # Automatic: a canceled intent is a failed payment.
-            manual = obj.get("capture_method") == "manual"
-            return PaymentUpdate(
-                payment_event=(
-                    PaymentEvent.LOCK_RELEASED
-                    if manual
-                    else PaymentEvent.FAILED
-                ),
-                external_id=external_id,
-                provider_event_id=event_id,
-                provider_data={
-                    "cancellation_reason": obj.get("cancellation_reason"),
-                },
-            )
+            return self._canceled_update(obj, event_id)
         logger.info("Ignoring stripe event %s (%s)", event_type, event_id)
         return None
 
@@ -437,6 +495,35 @@ class StripeProcessor(BaseProcessor):
         )
         return None
 
+    def _map_review_event(
+        self, event_type: str, obj: dict, event_id: str | None
+    ) -> PaymentUpdate | None:
+        external_id = obj.get("payment_intent")
+        if event_type == "review.opened":
+            return PaymentUpdate(
+                fraud_event=FraudEvent.REVIEW,
+                external_id=external_id,
+                provider_event_id=event_id,
+            )
+        if event_type == "review.closed":
+            closed_reason = str(obj.get("closed_reason") or "")
+            # TODO(SPEC §12): verify closed_reason semantics against
+            # live test mode; "approved" is documented, the rest are
+            # treated as rejection.
+            return PaymentUpdate(
+                fraud_event=(
+                    FraudEvent.ACCEPT
+                    if closed_reason == "approved"
+                    else FraudEvent.REJECT
+                ),
+                fraud_message=closed_reason,
+                external_id=external_id,
+                provider_event_id=event_id,
+            )
+        logger.info("Ignoring stripe event %s (%s)", event_type, event_id)
+        return None
+
+
     async def fetch_payment_status(self, **kwargs) -> PaymentUpdate | None:
         """PULL flow: retrieve the Session or PaymentIntent (SPEC §7).
 
@@ -474,34 +561,14 @@ class StripeProcessor(BaseProcessor):
     def _map_pulled_intent(
         self, intent: "stripe.PaymentIntent"
     ) -> PaymentUpdate | None:
-        currency = str(intent.currency)
+        # StripeObject subclasses dict, so the webhook-path mappers
+        # apply directly; pull updates carry no provider_event_id.
         if intent.status == "requires_capture":
-            return PaymentUpdate(
-                payment_event=PaymentEvent.LOCKED,
-                locked_amount=from_minor(
-                    intent.amount_capturable, currency
-                ),
-                external_id=intent.id,
-            )
+            return self._locked_update(intent)
         if intent.status == "succeeded":
-            return PaymentUpdate(
-                payment_event=PaymentEvent.PAYMENT_CAPTURED,
-                paid_amount=from_minor(intent.amount_received, currency),
-                external_id=intent.id,
-            )
+            return self._captured_update(intent)
         if intent.status == "canceled":
-            manual = intent.capture_method == "manual"
-            return PaymentUpdate(
-                payment_event=(
-                    PaymentEvent.LOCK_RELEASED
-                    if manual
-                    else PaymentEvent.FAILED
-                ),
-                external_id=intent.id,
-                provider_data={
-                    "cancellation_reason": intent.cancellation_reason,
-                },
-            )
+            return self._canceled_update(intent)
         return None
 
     def _require_payment_intent_id(
@@ -647,31 +714,3 @@ class StripeProcessor(BaseProcessor):
             )
             return False
         return True
-
-    def _map_review_event(
-        self, event_type: str, obj: dict, event_id: str | None
-    ) -> PaymentUpdate | None:
-        external_id = obj.get("payment_intent")
-        if event_type == "review.opened":
-            return PaymentUpdate(
-                fraud_event=FraudEvent.REVIEW,
-                external_id=external_id,
-                provider_event_id=event_id,
-            )
-        if event_type == "review.closed":
-            closed_reason = str(obj.get("closed_reason") or "")
-            # TODO(SPEC §12): verify closed_reason semantics against
-            # live test mode; "approved" is documented, the rest are
-            # treated as rejection.
-            return PaymentUpdate(
-                fraud_event=(
-                    FraudEvent.ACCEPT
-                    if closed_reason == "approved"
-                    else FraudEvent.REJECT
-                ),
-                fraud_message=closed_reason,
-                external_id=external_id,
-                provider_event_id=event_id,
-            )
-        logger.info("Ignoring stripe event %s (%s)", event_type, event_id)
-        return None

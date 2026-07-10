@@ -25,7 +25,9 @@ STRIPE_TRANSITIONS: dict[str, set[str]] = {
         "succeeded",
         "expired",
     },
-    "processing": {"succeeded", "canceled"},
+    # declined: an async payment can fail after submission; the
+    # session reopens for retry
+    "processing": {"succeeded", "canceled", "declined"},
     "requires_capture": {"succeeded", "canceled"},
     "succeeded": set(),
     "canceled": set(),

@@ -21,6 +21,13 @@ if TYPE_CHECKING:
     from getpaid_simulator.core.webhooks import WebhookTransport
 
 
+#: Fake-id prefixes (SPEC §10) — single source for routes and payloads.
+SESSION_PREFIX = "cs_sim_"
+INTENT_PREFIX = "pi_sim_"
+REFUND_PREFIX = "re_sim_"
+CHARGE_PREFIX = "ch_sim_"
+
+
 def _as_int(value: Any) -> int:
     """Undo SimulatorStorage's stringification of integer amounts."""
     return int(value or 0)
@@ -80,7 +87,7 @@ def refund_object(
     refund: dict[str, Any], order: dict[str, Any]
 ) -> dict[str, Any]:
     return {
-        "id": f"re_sim_{refund['id']}",
+        "id": f"{REFUND_PREFIX}{refund['id']}",
         "object": "refund",
         "status": refund.get("status", "pending"),
         "amount": _as_int(refund.get("amount")),

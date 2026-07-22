@@ -104,9 +104,7 @@ class StripeProcessor(BaseProcessor):
         http_client = self.get_setting("http_client")
         if http_client is not None:
             client_kwargs["http_client"] = http_client
-        return StripeClient(
-            str(self.get_setting("api_key")), **client_kwargs
-        )
+        return StripeClient(str(self.get_setting("api_key")), **client_kwargs)
 
     def _resolve_url(self, template: str) -> str:
         """Format ``{payment_id}``; leave Stripe's own
@@ -134,9 +132,7 @@ class StripeProcessor(BaseProcessor):
         success_url = kwargs.get("success_url") or self.get_setting(
             "success_url"
         )
-        cancel_url = kwargs.get("cancel_url") or self.get_setting(
-            "cancel_url"
-        )
+        cancel_url = kwargs.get("cancel_url") or self.get_setting("cancel_url")
         if not success_url or not cancel_url:
             raise ValueError(
                 "Stripe processor requires 'success_url' and 'cancel_url' "
@@ -263,6 +259,49 @@ class StripeProcessor(BaseProcessor):
                 f"Invalid webhook payload: {exc}"
             ) from exc
 
+    @classmethod
+    def extract_callback_correlation(
+        cls, data: dict, headers: dict
+    ) -> dict[str, str] | None:
+        """Correlation handles for a paymentless webhook (SPEC §6/§7).
+
+        Stripe delivers every event to one Dashboard-configured URL with no
+        payment pk, so a framework adapter must resolve the local Payment from
+        the event body before the payment-bound verify + ``handle_callback``
+        run. Returns the forward direction of :meth:`_is_correlated`:
+
+        - ``payment_id`` — our id, from the object ``metadata.payment_id`` or a
+          session ``client_reference_id`` (session / payment_intent events);
+        - ``external_id`` — the PaymentIntent id, from a ``payment_intent``
+          back-reference or the object's own ``pi_…`` id (refund and review
+          events carry no payment_id, only this).
+
+        ``None`` when neither is present: the event is uncorrelatable
+        (subscription-born traffic on a shared account) and the adapter
+        log-and-ignores. Pure over the event body — no bound payment, no
+        config — hence a classmethod the adapter calls off the class it
+        looked up by slug.
+        """
+        obj = ((data or {}).get("data") or {}).get("object") or {}
+        correlation: dict[str, str] = {}
+
+        metadata = obj.get("metadata") or {}
+        payment_id = metadata.get("payment_id") or obj.get(
+            "client_reference_id"
+        )
+        if payment_id:
+            correlation["payment_id"] = str(payment_id)
+
+        external_id = obj.get("payment_intent")
+        if not external_id:
+            obj_id = obj.get("id")
+            if isinstance(obj_id, str) and obj_id.startswith("pi_"):
+                external_id = obj_id
+        if external_id:
+            correlation["external_id"] = str(external_id)
+
+        return correlation or None
+
     def _is_correlated(self, obj: dict) -> bool:
         """Positive correlation of a payload to this payment (SPEC §7).
 
@@ -327,17 +366,14 @@ class StripeProcessor(BaseProcessor):
             "payment_intent.partially_funded",
         ) or event_type.startswith("charge."):
             # Duplicates of PI/Refund truth — deliberately ignored.
-            logger.debug(
-                "Ignoring stripe event %s (%s)", event_type, event_id
-            )
+            logger.debug("Ignoring stripe event %s (%s)", event_type, event_id)
             return None
 
         if event_type.startswith(
             ("checkout.session.", "payment_intent.", "refund.", "review.")
         ) and not self._is_correlated(obj):
             logger.warning(
-                "Ignoring uncorrelatable stripe event %s (%s) for "
-                "payment %s",
+                "Ignoring uncorrelatable stripe event %s (%s) for payment %s",
                 event_type,
                 event_id,
                 self.payment.id,
@@ -523,7 +559,6 @@ class StripeProcessor(BaseProcessor):
         logger.info("Ignoring stripe event %s (%s)", event_type, event_id)
         return None
 
-
     async def fetch_payment_status(self, **kwargs) -> PaymentUpdate | None:
         """PULL flow: retrieve the Session or PaymentIntent (SPEC §7).
 
@@ -542,9 +577,7 @@ class StripeProcessor(BaseProcessor):
 
         client = self._get_client()
         if external_id.startswith("cs_"):
-            session = await client.checkout.sessions.retrieve_async(
-                external_id
-            )
+            session = await client.checkout.sessions.retrieve_async(external_id)
             if session.status == "expired":
                 return PaymentUpdate(
                     payment_event=PaymentEvent.FAILED,
@@ -571,9 +604,7 @@ class StripeProcessor(BaseProcessor):
             return self._canceled_update(intent)
         return None
 
-    def _require_payment_intent_id(
-        self, exc_class: type[Exception]
-    ) -> str:
+    def _require_payment_intent_id(self, exc_class: type[Exception]) -> str:
         """The invariant of SPEC §6: external_id is the id money
         operations act on. Before the promoting webhook it is still
         cs_… and no money operation is possible."""

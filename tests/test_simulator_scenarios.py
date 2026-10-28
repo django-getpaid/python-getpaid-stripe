@@ -327,8 +327,13 @@ async def test_cancel_refund_requires_action_path(harness):
     assert events_of(updates) == [PaymentEvent.REFUND_REQUESTED]
 
     assert await harness.processor.cancel_refund() is True
+    refund_id = result.provider_data["refund_id"]
+    assert harness.payment.provider_data[
+        f"refund_terminal:{refund_id}"
+    ] == "canceled"
     updates = await harness.drain_updates()
-    assert events_of(updates) == [PaymentEvent.REFUND_CANCELLED]
+    # Core applies cancellation from the API result; its webhook is a duplicate.
+    assert events_of(updates) == []
 
 
 async def test_cancel_refund_card_path_returns_false(harness):

@@ -118,11 +118,33 @@ Klarna, PayPal yes; ACH, iDEAL no).
 `start_refund()` refunds the full captured amount,
 `start_refund(amount)` a part of it (multiple partials allowed). The
 refund id is stored in `provider_data["refund_id"]` (latest refund
-only). Failed/canceled refund IDs and their outcomes are retained in
-`provider_data["refund_terminal_statuses"]`. Late events for those IDs are
-ignored, even with a new event ID or after a retry has started. Persist
-provider data with each payment update; do not clear this history when
-starting another refund. A successful status is not treated as permanent:
+only). Failed/canceled refund IDs and their outcomes are retained in separate
+`provider_data["refund_terminal:<refund_id>"]` keys. Successful API cancellation
+also records the canceled ID on the bound payment; core's cancellation flow saves
+it. Direct processor callers must save that payment themselves. The original
+`refund_terminal_statuses` dictionary remains readable and is not removed.
+Late events for recorded terminal IDs are ignored, even with a new event ID or
+after a retry has started. Independent keys avoid replacing another refund's
+history when core shallow-merges updates mapped from stale snapshots.
+
+Persist provider data with each payment update; do not clear this history when
+starting another refund. Adapters must serialize the complete load/map/apply/save
+and cancellation/retry lifecycle per payment, or provide equivalent conflict
+detection and revalidation. Independent keys do **not** prevent lost updates
+from concurrent saves of entire payment snapshots, or make a stale mapping safe
+to apply after a newer lifecycle change.
+
+**Existing-payment rollout boundary:** records without retained terminal IDs are
+not retrospectively protected. Replaying an already-deduplicated event does not
+backfill them. Before use (including beta), the operator must establish the
+applicable existing-user, integration and payment obligations and reconcile the
+needed terminal identities from retained provider/payment records under serialized
+writes. This repair does not provide a historical backfill or establish deployment
+applicability; do not treat a version label as evidence that no obligations exist.
+Preserve both legacy dictionaries and new keys; older plugin versions do not read
+the new keys, so a code rollback alone does not preserve the new ordering protection.
+
+A successful status is not treated as permanent:
 a bank can return funds later (see [Stripe refund handling](https://docs.stripe.com/refunds#failed-refunds)).
 Refund `reason` is deliberately not exposed — Stripe's `fraudulent` value
 has card-block side effects.

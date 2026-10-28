@@ -266,7 +266,10 @@ async def test_terminal_refund_cannot_become_pending_again(
     assert payment.provider_data["refund_id"] == "re_test_0001"
 
 
-@pytest.mark.parametrize("late_status", ["pending", "failed", "canceled"])
+@pytest.mark.parametrize(
+    "late_status",
+    ["pending", "requires_action", "succeeded", "failed", "canceled"],
+)
 async def test_old_refund_event_cannot_resolve_a_new_attempt(
     stripe_config, late_status
 ):
@@ -340,6 +343,56 @@ async def test_stale_terminal_updates_preserve_distinct_refund_ids(
         assert await handle(processor, late) is None
     assert payment.status == PaymentStatus.REFUND_STARTED
     assert payment.provider_data["refund_id"] == "re_retry"
+
+
+@pytest.mark.parametrize("terminal", ["failed", "canceled"])
+@pytest.mark.parametrize(
+    "late_status",
+    ["pending", "requires_action", "succeeded", "failed", "canceled"],
+)
+async def test_legacy_terminal_history_remains_effective(
+    stripe_config, terminal, late_status
+):
+    history = {"re_old": terminal}
+    payment = make_mock_payment(
+        external_id="pi_test_0001",
+        provider_data={
+            "refund_id": "re_retry",
+            "refund_terminal_statuses": history,
+        },
+    )
+    processor = StripeProcessor(payment, stripe_config)
+    late = payloads.event(
+        "refund.updated",
+        payloads.refund(refund_id="re_old", status=late_status),
+    )
+    assert await handle(processor, late) is None
+    assert payment.provider_data["refund_terminal_statuses"] == history
+    assert payment.provider_data["refund_id"] == "re_retry"
+
+
+async def test_unrecorded_external_partial_refund_is_not_blocked(stripe_config):
+    payment = make_mock_payment(
+        external_id="pi_test_0001",
+        provider_data={
+            "refund_id": "re_previous",
+            "refund_terminal:re_failed": "failed",
+        },
+    )
+    processor = StripeProcessor(payment, stripe_config)
+    update = await handle(
+        processor,
+        payloads.event(
+            "refund.created",
+            payloads.refund(
+                refund_id="pyr_external", status="succeeded", amount=2500
+            ),
+        ),
+    )
+    assert update is not None
+    assert update.payment_event == PaymentEvent.REFUND_CONFIRMED
+    assert update.refunded_amount == Decimal("25.00")
+    assert update.provider_data["refund_id"] == "pyr_external"
 
 
 async def test_refund_without_identity_is_rejected(processor):

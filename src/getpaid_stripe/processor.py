@@ -503,10 +503,15 @@ class StripeProcessor(BaseProcessor):
         refund_id = obj.get("id")
         if not isinstance(refund_id, str) or not refund_id:
             raise InvalidCallbackError("Refund callback has no refund ID")
-        terminal_statuses = dict(
-            self.payment.provider_data.get("refund_terminal_statuses", {})
+        # Read the original nested format without replacing or deleting it.
+        terminal_statuses = self.payment.provider_data.get(
+            "refund_terminal_statuses", {}
         )
-        if refund_id in terminal_statuses:
+        terminal_key = f"refund_terminal:{refund_id}"
+        if (
+            refund_id in terminal_statuses
+            or terminal_key in self.payment.provider_data
+        ):
             # Different event IDs can describe the same refund, out of order.
             # Its terminal outcome also survives a later refund attempt, so
             # an old failure cannot cancel that newer pending operation.
@@ -519,8 +524,9 @@ class StripeProcessor(BaseProcessor):
         provider_data: dict[str, Any] = {"refund_id": refund_id}
         # Success is not terminal: a bank can subsequently return funds.
         if status in ("failed", "canceled"):
-            terminal_statuses[refund_id] = status
-            provider_data["refund_terminal_statuses"] = terminal_statuses
+            # Core merges provider data shallowly. Independent keys preserve
+            # both identities even when updates were mapped from stale data.
+            provider_data[terminal_key] = status
 
         if status in ("pending", "requires_action"):
             return PaymentUpdate(

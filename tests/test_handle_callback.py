@@ -295,9 +295,51 @@ async def test_old_refund_event_cannot_resolve_a_new_attempt(
 
     assert payment.status == PaymentStatus.REFUND_STARTED
     assert payment.provider_data["refund_id"] == "re_retry"
-    assert payment.provider_data["refund_terminal_statuses"] == {
-        "re_test_0001": "failed"
-    }
+    assert payment.provider_data["refund_terminal:re_test_0001"] == "failed"
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+async def test_stale_terminal_updates_preserve_distinct_refund_ids(
+    stripe_config, reverse
+):
+    """Mapping snapshots must not replace another refund's terminal record."""
+    payment = make_mock_payment(
+        external_id="pi_test_0001", status=PaymentStatus.REFUND_STARTED
+    )
+    payment.amount_paid = Decimal("100.00")
+    updates = []
+    for refund_id in ("re_A", "pyr_C"):
+        snapshot = make_mock_payment(external_id="pi_test_0001")
+        processor = StripeProcessor(snapshot, stripe_config)
+        updates.append(
+            await handle(
+                processor,
+                payloads.event(
+                    "refund.failed",
+                    payloads.refund(refund_id=refund_id, status="failed"),
+                    event_id=f"evt_{refund_id}",
+                ),
+            )
+        )
+    for update in reversed(updates) if reverse else updates:
+        apply_payment_update(payment, update)
+    apply_payment_update(
+        payment,
+        PaymentUpdate(
+            payment_event=PaymentEvent.REFUND_REQUESTED,
+            provider_data={"refund_id": "re_retry", "status": "pending"},
+        ),
+    )
+    for refund_id in ("re_A", "pyr_C"):
+        processor = StripeProcessor(payment, stripe_config)
+        late = payloads.event(
+            "refund.failed",
+            payloads.refund(refund_id=refund_id, status="failed"),
+            event_id=f"evt_late_{refund_id}",
+        )
+        assert await handle(processor, late) is None
+    assert payment.status == PaymentStatus.REFUND_STARTED
+    assert payment.provider_data["refund_id"] == "re_retry"
 
 
 async def test_refund_without_identity_is_rejected(processor):

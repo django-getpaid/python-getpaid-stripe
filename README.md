@@ -118,8 +118,14 @@ Klarna, PayPal yes; ACH, iDEAL no).
 `start_refund()` refunds the full captured amount,
 `start_refund(amount)` a part of it (multiple partials allowed). The
 refund id is stored in `provider_data["refund_id"]` (latest refund
-only). Refund `reason` is deliberately not exposed — Stripe's
-`fraudulent` value has card-block side effects.
+only). Failed/canceled refund IDs and their outcomes are retained in
+`provider_data["refund_terminal_statuses"]`. Late events for those IDs are
+ignored, even with a new event ID or after a retry has started. Persist
+provider data with each payment update; do not clear this history when
+starting another refund. A successful status is not treated as permanent:
+a bank can return funds later (see [Stripe refund handling](https://docs.stripe.com/refunds#failed-refunds)).
+Refund `reason` is deliberately not exposed — Stripe's `fraudulent` value
+has card-block side effects.
 
 **`cancel_refund()` effectively always returns `False` for card
 payments**: only refunds in `requires_action` (bank-transfer-style

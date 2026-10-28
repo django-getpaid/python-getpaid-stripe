@@ -5,7 +5,10 @@ from decimal import Decimal
 import pytest
 from getpaid_core.enums import FraudEvent
 from getpaid_core.enums import PaymentEvent
+from getpaid_core.enums import PaymentStatus
 from getpaid_core.exceptions import InvalidCallbackError
+from getpaid_core.fsm import apply_payment_update
+from getpaid_core.types import PaymentUpdate
 
 from getpaid_stripe.processor import StripeProcessor
 
@@ -163,8 +166,7 @@ async def test_canceled_manual_capture_maps_to_lock_released(processor):
     assert update is not None
     assert update.payment_event == PaymentEvent.LOCK_RELEASED
     assert (
-        update.provider_data["cancellation_reason"]
-        == "requested_by_customer"
+        update.provider_data["cancellation_reason"] == "requested_by_customer"
     )
 
 
@@ -201,9 +203,7 @@ async def test_payment_intent_noise_ignored(processor, event_type):
 
 
 @pytest.mark.parametrize("status", ["pending", "requires_action"])
-@pytest.mark.parametrize(
-    "event_type", ["refund.created", "refund.updated"]
-)
+@pytest.mark.parametrize("event_type", ["refund.created", "refund.updated"])
 async def test_refund_in_flight_maps_to_refund_requested(
     processor, event_type, status
 ):
@@ -216,12 +216,8 @@ async def test_refund_in_flight_maps_to_refund_requested(
     assert update.external_id == "pi_test_0001"
 
 
-@pytest.mark.parametrize(
-    "event_type", ["refund.created", "refund.updated"]
-)
-async def test_refund_succeeded_maps_to_refund_confirmed(
-    processor, event_type
-):
+@pytest.mark.parametrize("event_type", ["refund.created", "refund.updated"])
+async def test_refund_succeeded_maps_to_refund_confirmed(processor, event_type):
     evt = payloads.event(
         event_type, payloads.refund(status="succeeded", amount=2500)
     )
@@ -233,9 +229,7 @@ async def test_refund_succeeded_maps_to_refund_confirmed(
 
 
 @pytest.mark.parametrize("status", ["failed", "canceled"])
-@pytest.mark.parametrize(
-    "event_type", ["refund.updated", "refund.failed"]
-)
+@pytest.mark.parametrize("event_type", ["refund.updated", "refund.failed"])
 async def test_refund_terminal_failure_maps_to_refund_cancelled(
     processor, event_type, status
 ):
@@ -246,14 +240,79 @@ async def test_refund_terminal_failure_maps_to_refund_cancelled(
     assert update.payment_event == PaymentEvent.REFUND_CANCELLED
 
 
+@pytest.mark.parametrize("terminal", ["failed", "canceled"])
+async def test_terminal_refund_cannot_become_pending_again(
+    stripe_config, terminal
+):
+    payment = make_mock_payment(
+        external_id="pi_test_0001", status=PaymentStatus.REFUND_STARTED
+    )
+    payment.amount_paid = Decimal("100.00")
+    processor = StripeProcessor(payment, stripe_config)
+    terminal_event = payloads.event(
+        "refund.updated", payloads.refund(status=terminal)
+    )
+    apply_payment_update(payment, await handle(processor, terminal_event))
+    expected = payment.status
+
+    pending_event = payloads.event(
+        "refund.updated",
+        payloads.refund(status="pending"),
+        event_id="evt_late_pending",
+    )
+    apply_payment_update(payment, await handle(processor, pending_event))
+
+    assert payment.status == expected
+    assert payment.provider_data["refund_id"] == "re_test_0001"
+
+
+@pytest.mark.parametrize("late_status", ["pending", "failed", "canceled"])
+async def test_old_refund_event_cannot_resolve_a_new_attempt(
+    stripe_config, late_status
+):
+    payment = make_mock_payment(
+        external_id="pi_test_0001", status=PaymentStatus.REFUND_STARTED
+    )
+    payment.amount_paid = Decimal("100.00")
+    failed = payloads.event("refund.failed", payloads.refund(status="failed"))
+    processor = StripeProcessor(payment, stripe_config)
+    apply_payment_update(payment, await handle(processor, failed))
+    apply_payment_update(
+        payment,
+        PaymentUpdate(
+            payment_event=PaymentEvent.REFUND_REQUESTED,
+            provider_data={"refund_id": "re_retry", "status": "pending"},
+        ),
+    )
+
+    late = payloads.event(
+        "refund.updated",
+        payloads.refund(status=late_status),
+        event_id="evt_old_refund_different_delivery",
+    )
+    processor = StripeProcessor(payment, stripe_config)
+    apply_payment_update(payment, await handle(processor, late))
+
+    assert payment.status == PaymentStatus.REFUND_STARTED
+    assert payment.provider_data["refund_id"] == "re_retry"
+    assert payment.provider_data["refund_terminal_statuses"] == {
+        "re_test_0001": "failed"
+    }
+
+
+async def test_refund_without_identity_is_rejected(processor):
+    obj = payloads.refund()
+    del obj["id"]
+    with pytest.raises(InvalidCallbackError, match="no refund ID"):
+        await handle(processor, payloads.event("refund.updated", obj))
+
+
 async def test_stripe_generated_expiry_refund_still_maps(processor):
     # Expired uncaptured auths produce unprompted Stripe refunds;
     # status-driven mapping must handle them like any other refund.
     evt = payloads.event(
         "refund.created",
-        payloads.refund(
-            status="succeeded", reason="expired_uncaptured_charge"
-        ),
+        payloads.refund(status="succeeded", reason="expired_uncaptured_charge"),
     )
     update = await handle(processor, evt)
 
@@ -274,9 +333,7 @@ async def test_stripe_generated_expiry_refund_still_maps(processor):
     ],
 )
 async def test_charge_events_ignored(processor, event_type):
-    evt = payloads.event(
-        event_type, {"id": "ch_test_1", "object": "charge"}
-    )
+    evt = payloads.event(event_type, {"id": "ch_test_1", "object": "charge"})
     assert await handle(processor, evt) is None
 
 
@@ -360,9 +417,7 @@ async def test_foreign_payment_metadata_rejected(stripe_config):
     )
     evt = payloads.event(
         "payment_intent.succeeded",
-        payloads.payment_intent(
-            amount_received=10000, payment_id="payment-B"
-        ),
+        payloads.payment_intent(amount_received=10000, payment_id="payment-B"),
     )
     with pytest.raises(InvalidCallbackError):
         await handle(processor, evt)

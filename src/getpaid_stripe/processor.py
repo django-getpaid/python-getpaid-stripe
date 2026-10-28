@@ -500,7 +500,27 @@ class StripeProcessor(BaseProcessor):
         of refund.created/updated/failed delivered it."""
         status = str(obj.get("status", ""))
         external_id = obj.get("payment_intent")
-        provider_data = {"refund_id": obj.get("id")}
+        refund_id = obj.get("id")
+        if not isinstance(refund_id, str) or not refund_id:
+            raise InvalidCallbackError("Refund callback has no refund ID")
+        terminal_statuses = dict(
+            self.payment.provider_data.get("refund_terminal_statuses", {})
+        )
+        if refund_id in terminal_statuses:
+            # Different event IDs can describe the same refund, out of order.
+            # Its terminal outcome also survives a later refund attempt, so
+            # an old failure cannot cancel that newer pending operation.
+            logger.info(
+                "Ignoring late event %s for terminal refund %s",
+                event_id,
+                refund_id,
+            )
+            return None
+        provider_data: dict[str, Any] = {"refund_id": refund_id}
+        # Success is not terminal: a bank can subsequently return funds.
+        if status in ("failed", "canceled"):
+            terminal_statuses[refund_id] = status
+            provider_data["refund_terminal_statuses"] = terminal_statuses
 
         if status in ("pending", "requires_action"):
             return PaymentUpdate(

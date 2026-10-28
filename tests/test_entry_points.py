@@ -2,10 +2,17 @@
 
 from getpaid_core.processor import BaseProcessor
 from getpaid_core.registry import PluginRegistry
+from packaging.version import Version
+
+from getpaid_stripe import __version__
 
 
 class TestEntryPoints:
     """Verify entry points are correctly registered."""
+
+    def test_release_version_is_public(self):
+        """The release workflow publishes this version to public PyPI."""
+        assert Version(__version__).local is None
 
     def test_stripe_backend_entry_point(self):
         """StripeProcessor must be discoverable via entry points."""

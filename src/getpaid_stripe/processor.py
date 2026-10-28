@@ -770,4 +770,11 @@ class StripeProcessor(BaseProcessor):
                 "Stripe refused to cancel refund %s: %s", refund_id, exc
             )
             return False
+        # The core cancellation API returns only bool, not provider data.
+        # Its successful flow saves this same payment after applying the FSM
+        # event. Replace the dict so JSON-backed adapters see the change.
+        self.payment.provider_data = {
+            **self.payment.provider_data,
+            f"refund_terminal:{refund_id}": "canceled",
+        }
         return True

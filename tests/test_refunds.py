@@ -1,15 +1,20 @@
 """start_refund() / cancel_refund() tests (SPEC §9)."""
 
+from copy import deepcopy
 from decimal import Decimal
 from urllib.parse import parse_qsl
 
 import pytest
 import respx
+from getpaid_core.enums import PaymentStatus
 from getpaid_core.exceptions import RefundFailure
+from getpaid_core.flow import PaymentFlow
+from getpaid_core.fsm import apply_payment_update
 from httpx import Response
 
 from getpaid_stripe.processor import StripeProcessor
 
+from . import payloads
 from .conftest import make_mock_payment
 
 
@@ -128,6 +133,54 @@ async def test_cancel_refund_requires_action_path_returns_true(
     )
     assert await processor.cancel_refund() is True
     assert cancel.called
+
+
+@pytest.mark.parametrize(
+    "late_status",
+    ["pending", "requires_action", "succeeded", "failed", "canceled"],
+)
+async def test_api_cancellation_survives_save_reload_and_retry(
+    stripe_config, router, late_status
+):
+    class SnapshotRepository:
+        async def save(self, payment):
+            self.saved = deepcopy(payment)
+
+    repository = SnapshotRepository()
+    flow = PaymentFlow(repository, config={"stripe": stripe_config})
+    payment = make_mock_payment(
+        external_id=PI,
+        status=PaymentStatus.REFUND_STARTED,
+        provider_data={
+            "refund_id": "re_test_0001",
+            "refund_terminal_statuses": {"re_older": "failed"},
+        },
+    )
+    payment.amount_paid = Decimal("100.00")
+    router.post("/v1/refunds/re_test_0001/cancel").mock(
+        return_value=Response(200, json=refund_json(status="canceled"))
+    )
+    router.post("/v1/refunds").mock(
+        return_value=Response(200, json=refund_json(refund_id="re_retry"))
+    )
+
+    assert await flow.cancel_refund(payment) is True
+    payment = repository.saved
+    assert payment.status == PaymentStatus.PAID
+    await flow.start_refund(payment)
+    payment = repository.saved
+    processor = StripeProcessor(payment, stripe_config)
+    late = payloads.event(
+        "refund.updated",
+        payloads.refund(status=late_status),
+        event_id="evt_late_canceled_refund",
+    )
+    apply_payment_update(payment, await processor.handle_callback(late, {}))
+    assert payment.status == PaymentStatus.REFUND_STARTED
+    assert payment.provider_data["refund_id"] == "re_retry"
+    assert payment.provider_data["refund_terminal_statuses"] == {
+        "re_older": "failed"
+    }
 
 
 async def test_cancel_refund_stripe_rejection_returns_false(

@@ -332,8 +332,11 @@ async def test_cancel_refund_requires_action_path(harness):
         f"refund_terminal:{refund_id}"
     ] == "canceled"
     updates = await harness.drain_updates()
-    # Core applies cancellation from the API result; its webhook is a duplicate.
-    assert events_of(updates) == []
+    # Direct processor callers still receive the semantic confirmation.
+    assert events_of(updates) == [PaymentEvent.REFUND_CANCELLED]
+    assert updates[0].provider_data[
+        f"refund_cancel_unconfirmed:{refund_id}"
+    ] is False
 
 
 async def test_cancel_refund_card_path_returns_false(harness):

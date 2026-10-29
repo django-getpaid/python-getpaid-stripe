@@ -120,11 +120,15 @@ Klarna, PayPal yes; ACH, iDEAL no).
 refund id is stored in `provider_data["refund_id"]` (latest refund
 only). Failed/canceled refund IDs and their outcomes are retained in separate
 `provider_data["refund_terminal:<refund_id>"]` keys. Successful API cancellation
-also records the canceled ID on the bound payment; core's cancellation flow saves
-it. Direct processor callers must save that payment themselves. The original
-`refund_terminal_statuses` dictionary remains readable and is not removed.
-Late events for recorded terminal IDs are ignored, even with a new event ID or
-after a retry has started. Independent keys avoid replacing another refund's
+also records the canceled ID and sets
+`provider_data["refund_cancel_unconfirmed:<refund_id>"]` on the bound payment;
+core's cancellation flow saves it. Direct processor callers must save that payment
+themselves. The first failed/canceled webhook for that still-current refund emits
+`REFUND_CANCELLED` and clears the flag through its update, so direct callers can
+complete cancellation. Apply and save the update, including provider data. The
+original `refund_terminal_statuses` dictionary remains readable and is not removed.
+Other late events for recorded terminal IDs are ignored, even with a new event ID
+or after a retry has started. Independent keys avoid replacing another refund's
 history when core shallow-merges updates mapped from stale snapshots.
 
 Persist provider data with each payment update; do not clear this history when

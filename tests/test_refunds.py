@@ -6,6 +6,7 @@ from urllib.parse import parse_qsl
 
 import pytest
 import respx
+from getpaid_core.enums import PaymentEvent
 from getpaid_core.enums import PaymentStatus
 from getpaid_core.exceptions import RefundFailure
 from getpaid_core.flow import PaymentFlow
@@ -181,6 +182,53 @@ async def test_api_cancellation_survives_save_reload_and_retry(
     assert payment.provider_data["refund_terminal_statuses"] == {
         "re_older": "failed"
     }
+
+
+@pytest.mark.parametrize("terminal_status", ["canceled", "failed"])
+async def test_direct_cancellation_preserves_first_callback_confirmation(
+    stripe_config, router, terminal_status
+):
+    payment = make_mock_payment(
+        external_id=PI,
+        status=PaymentStatus.REFUND_STARTED,
+        provider_data={"refund_id": "re_test_0001"},
+    )
+    payment.amount_paid = Decimal("100.00")
+    router.post("/v1/refunds/re_test_0001/cancel").mock(
+        return_value=Response(200, json=refund_json(status="canceled"))
+    )
+    processor = StripeProcessor(payment, stripe_config)
+    assert await processor.cancel_refund() is True
+
+    # Direct consumers persist API metadata but apply lifecycle events later.
+    payment = deepcopy(payment)
+    assert payment.status == PaymentStatus.REFUND_STARTED
+    processor = StripeProcessor(payment, stripe_config)
+    confirmation = await processor.handle_callback(
+        payloads.event(
+            "refund.updated", payloads.refund(status=terminal_status)
+        ),
+        {},
+    )
+    assert confirmation is not None
+    assert confirmation.payment_event == PaymentEvent.REFUND_CANCELLED
+    apply_payment_update(payment, confirmation)
+    payment = deepcopy(payment)
+    assert payment.status == PaymentStatus.PAID
+    assert payment.provider_data["refund_id"] == "re_test_0001"
+
+    processor = StripeProcessor(payment, stripe_config)
+    for late_status in (
+        "pending", "requires_action", "succeeded", "failed", "canceled"
+    ):
+        assert await processor.handle_callback(
+            payloads.event(
+                "refund.updated",
+                payloads.refund(status=late_status),
+                event_id=f"evt_late_{late_status}",
+            ),
+            {},
+        ) is None
 
 
 async def test_cancel_refund_stripe_rejection_returns_false(

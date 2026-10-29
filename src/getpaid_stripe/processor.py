@@ -508,13 +508,21 @@ class StripeProcessor(BaseProcessor):
             "refund_terminal_statuses", {}
         )
         terminal_key = f"refund_terminal:{refund_id}"
+        confirmation_key = f"refund_cancel_unconfirmed:{refund_id}"
+        confirmation_pending = self.payment.provider_data.get(
+            confirmation_key, False
+        )
+        confirms_current_cancellation = (
+            confirmation_pending
+            and refund_id == self.payment.provider_data.get("refund_id")
+            and status in ("failed", "canceled")
+        )
         if (
             refund_id in terminal_statuses
             or terminal_key in self.payment.provider_data
-        ):
-            # Different event IDs can describe the same refund, out of order.
-            # Its terminal outcome also survives a later refund attempt, so
-            # an old failure cannot cancel that newer pending operation.
+        ) and not confirms_current_cancellation:
+            # API cancellation still needs its first webhook confirmation
+            # for direct callers, but must not resolve a newer refund attempt.
             logger.info(
                 "Ignoring late event %s for terminal refund %s",
                 event_id,
@@ -527,6 +535,8 @@ class StripeProcessor(BaseProcessor):
             # Core merges provider data shallowly. Independent keys preserve
             # both identities even when updates were mapped from stale data.
             provider_data[terminal_key] = status
+            if confirmation_pending:
+                provider_data[confirmation_key] = False
 
         if status in ("pending", "requires_action"):
             return PaymentUpdate(
@@ -770,11 +780,12 @@ class StripeProcessor(BaseProcessor):
                 "Stripe refused to cancel refund %s: %s", refund_id, exc
             )
             return False
-        # The core cancellation API returns only bool, not provider data.
-        # Its successful flow saves this same payment after applying the FSM
-        # event. Replace the dict so JSON-backed adapters see the change.
+        # Retain the terminal identity before a retry, but direct callers
+        # still need the first terminal webhook to apply REFUND_CANCELLED.
+        # Replace the dict so JSON-backed adapters see the change.
         self.payment.provider_data = {
             **self.payment.provider_data,
             f"refund_terminal:{refund_id}": "canceled",
+            f"refund_cancel_unconfirmed:{refund_id}": True,
         }
         return True

@@ -327,8 +327,16 @@ async def test_cancel_refund_requires_action_path(harness):
     assert events_of(updates) == [PaymentEvent.REFUND_REQUESTED]
 
     assert await harness.processor.cancel_refund() is True
+    refund_id = result.provider_data["refund_id"]
+    assert harness.payment.provider_data[
+        f"refund_terminal:{refund_id}"
+    ] == "canceled"
     updates = await harness.drain_updates()
+    # Direct processor callers still receive the semantic confirmation.
     assert events_of(updates) == [PaymentEvent.REFUND_CANCELLED]
+    assert updates[0].provider_data[
+        f"refund_cancel_unconfirmed:{refund_id}"
+    ] is False
 
 
 async def test_cancel_refund_card_path_returns_false(harness):

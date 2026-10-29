@@ -500,7 +500,43 @@ class StripeProcessor(BaseProcessor):
         of refund.created/updated/failed delivered it."""
         status = str(obj.get("status", ""))
         external_id = obj.get("payment_intent")
-        provider_data = {"refund_id": obj.get("id")}
+        refund_id = obj.get("id")
+        if not isinstance(refund_id, str) or not refund_id:
+            raise InvalidCallbackError("Refund callback has no refund ID")
+        # Read the original nested format without replacing or deleting it.
+        terminal_statuses = self.payment.provider_data.get(
+            "refund_terminal_statuses", {}
+        )
+        terminal_key = f"refund_terminal:{refund_id}"
+        confirmation_key = f"refund_cancel_unconfirmed:{refund_id}"
+        confirmation_pending = self.payment.provider_data.get(
+            confirmation_key, False
+        )
+        confirms_current_cancellation = (
+            confirmation_pending
+            and refund_id == self.payment.provider_data.get("refund_id")
+            and status in ("failed", "canceled")
+        )
+        if (
+            refund_id in terminal_statuses
+            or terminal_key in self.payment.provider_data
+        ) and not confirms_current_cancellation:
+            # API cancellation still needs its first webhook confirmation
+            # for direct callers, but must not resolve a newer refund attempt.
+            logger.info(
+                "Ignoring late event %s for terminal refund %s",
+                event_id,
+                refund_id,
+            )
+            return None
+        provider_data: dict[str, Any] = {"refund_id": refund_id}
+        # Success is not terminal: a bank can subsequently return funds.
+        if status in ("failed", "canceled"):
+            # Core merges provider data shallowly. Independent keys preserve
+            # both identities even when updates were mapped from stale data.
+            provider_data[terminal_key] = status
+            if confirmation_pending:
+                provider_data[confirmation_key] = False
 
         if status in ("pending", "requires_action"):
             return PaymentUpdate(
@@ -744,4 +780,12 @@ class StripeProcessor(BaseProcessor):
                 "Stripe refused to cancel refund %s: %s", refund_id, exc
             )
             return False
+        # Retain the terminal identity before a retry, but direct callers
+        # still need the first terminal webhook to apply REFUND_CANCELLED.
+        # Replace the dict so JSON-backed adapters see the change.
+        self.payment.provider_data = {
+            **self.payment.provider_data,
+            f"refund_terminal:{refund_id}": "canceled",
+            f"refund_cancel_unconfirmed:{refund_id}": True,
+        }
         return True
